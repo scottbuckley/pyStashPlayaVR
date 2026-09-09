@@ -1,9 +1,11 @@
 import asyncio
-from aiohttp import web
+from io import BytesIO
 import logging
-import os, re, math
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 
+from aiohttp import ClientError, ClientSession, web
+from PIL import Image
 import stashapi.log as log
 from stashapi.stashapp import StashInterface
 
@@ -13,19 +15,36 @@ from stashapi.stashapp import StashInterface
 # the port for this webserver
 PORT = 80
 
+# Logging level (you probably don't need to change this)
+LOG_LEVEL = logging.INFO
+
 # the address at which this script, and PlayaVR, will access a Stash instance
-STASH_SCHEME = "http"
-STASH_HOST   = "192.168.1.33"
-STASH_PORT   = "9999"
+STASH_SCHEME       = "http"
+STASH_CONNECT_HOST = "127.0.0.1"
+STASH_PORT         = "9999"
+
+# Leave as None to use the hostname or IP address PlayaVR used to reach this
+# server. Set a full URL such as "http://192.168.1.33:9999" to override it.
+STASH_PUBLIC_URL_OVERRIDE = None
+
+# VR tag mappings (you probably don't need to change these)
+# Tag names are matched case-insensitively. The first match wins.
+VR_TAG_FORMATS = {
+    "Fisheye": ("FSH", "LR"),
+    "180°":     ("180", "LR")
+}
+
+# Generic VR fallback (you probably don't need to change these)
+VR_FALLBACK_TAG = "Virtual Reality"
+VR_FALLBACK_FORMAT = ("180", "LR")
 
 ##### end config
 
 
 API_BASE = "/api/playa/v2/"
-STASH_BASE_URL = f"{STASH_SCHEME}://{STASH_HOST}:{STASH_PORT}"
 stash = StashInterface({
     "scheme": STASH_SCHEME,
-    "host":   STASH_HOST,
+    "host":   STASH_CONNECT_HOST,
     "port":   STASH_PORT,
     "logger": log
 })
@@ -38,21 +57,16 @@ def wrapJSON(data):
 
 
 def stashBaseURL(request):
-  return STASH_BASE_URL
-  # scheme = request.url.scheme
-  # host = request.url.host
-  # base_url = f"{scheme}://{host}:9999"
-  # return base_url
+  if STASH_PUBLIC_URL_OVERRIDE:
+    return STASH_PUBLIC_URL_OVERRIDE.rstrip('/')
 
-def getBaseURL(request):
-  scheme = request.url.scheme
   host = request.url.host
-  port = request.url.port
+  if ':' in host:
+    host = f"[{host}]"
+  return f"{STASH_SCHEME}://{host}:{STASH_PORT}"
 
-  base_url = f"{scheme}://{host}"
-  if port and (scheme == 'http' and port != 80 or scheme == 'https' and port != 443):
-      base_url += f":{port}"
-  return base_url
+def serverBaseURL(request):
+  return f"{request.scheme}://{request.host}"
 
 
 #### URL handlers
@@ -69,35 +83,103 @@ async def webGetConfig(request):
   print('/config requested')
   return web.json_response(wrapJSON({
     "site_name": "pyPlaya",
+    "auth": False,
     "actors": False,
     "categories": True,
     "studios": False,
     "categories_groups": False,
+    "scripts": False,
+    "masks": False,
     "analytics": False
   }))
 
 @routes.get(API_BASE+'categories')
 async def webGetCategories(request):
   print('/categories requested')
-  cats = [{'id': t['id'], 'title': t['name']} for t in stash.find_tags()]
+  tags = await asyncio.to_thread(stash.find_tags)
+  cats = [{'id': t['id'], 'title': t['name']} for t in tags]
   return web.json_response(wrapJSON(cats))
 
 def timestamp(date_str_iso):
-  return int(datetime.fromisoformat(date_str_iso).timestamp())
+  date = datetime.fromisoformat(date_str_iso.replace('Z', '+00:00'))
+  if date.tzinfo is None:
+    date = date.replace(tzinfo=timezone.utc)
+  return int(date.timestamp())
 
-def preview_image(idd):
-  return f"{STASH_BASE_URL}/scene/{idd}/screenshot"
+def preview_image(request, idd):
+  return f"{serverBaseURL(request)}/thumbnail/{idd}"
 
-def stream_url(idd):
-  return f"{STASH_BASE_URL}/scene/{idd}/stream"
+def stream_url(request, idd):
+  return f"{stashBaseURL(request)}/scene/{idd}/stream"
+
+def video_format(tags):
+  tag_names = {tag['name'].casefold() for tag in tags}
+  for tag_name, video_format in VR_TAG_FORMATS.items():
+    if tag_name.casefold() in tag_names:
+      return video_format
+  if VR_FALLBACK_TAG.casefold() in tag_names:
+    return VR_FALLBACK_FORMAT
+  return ('FLT', 'MN')
+
+def convert_webp_to_png(data):
+  with Image.open(BytesIO(data)) as image:
+    output = BytesIO()
+    image.save(output, format='PNG')
+    return output.getvalue()
+
+async def http_client_context(app):
+  async with ClientSession() as session:
+    app['http_client'] = session
+    yield
+
+@routes.get('/thumbnail/{idd}')
+async def webGetThumbnail(request):
+  try:
+    idd = int(request.match_info['idd'])
+  except (KeyError, TypeError, ValueError):
+    raise web.HTTPBadRequest(reason="thumbnail id must be an integer")
+
+  stash_url = f"{STASH_SCHEME}://{STASH_CONNECT_HOST}:{STASH_PORT}/scene/{idd}/screenshot"
+  try:
+    async with request.app['http_client'].get(stash_url) as response:
+      data = await response.read()
+      status = response.status
+      content_type = response.content_type
+  except ClientError as error:
+    raise web.HTTPBadGateway(reason=f"could not retrieve thumbnail from Stash: {error}")
+
+  if status != 200:
+    return web.Response(status=status, body=data, content_type=content_type)
+
+  if content_type == 'image/webp':
+    try:
+      data = await asyncio.to_thread(convert_webp_to_png, data)
+    except OSError as error:
+      raise web.HTTPBadGateway(reason=f"could not convert WebP thumbnail: {error}")
+    content_type = 'image/png'
+
+  return web.Response(
+    body=data,
+    content_type=content_type,
+    headers={'Cache-Control': 'no-cache'}
+  )
 
 @routes.get(API_BASE+'videos')
 async def webGetVideos(request):
-  pageIndex = int(request.query['page-index'])
-  pageSize  = int(request.query['page-size'])
-  order     = request.query['order']
-  direction = request.query['direction']
+  try:
+    pageIndex = int(request.query['page-index'])
+    pageSize  = int(request.query['page-size'])
+  except (KeyError, ValueError):
+    raise web.HTTPBadRequest(reason="page-index and page-size must be integers")
+
+  if pageIndex < 0 or pageSize < 1:
+    raise web.HTTPBadRequest(reason="page-index must be non-negative and page-size must be positive")
+
+  order     = request.query.get('order', 'release_date')
+  direction = request.query.get('direction', 'asc')
+  title     = request.query.get('title')
   cats      = request.query.get('included-categories', '')
+  excluded_cats = request.query.get('excluded-categories', '')
   
   # categories
   if (cats == ''):
@@ -105,24 +187,30 @@ async def webGetVideos(request):
   else:
     cats = cats.split(',')
 
-  # ordering
-  order_str = 'id'
-  if (order == 'title'):
-    order_str = 'title'
-  elif (order == 'release_date'):
-    order_str = 'created_at'
-  elif (order == 'popularity'):
-    order_str = 'play_count'
+  if (excluded_cats == ''):
+    excluded_cats = []
+  else:
+    excluded_cats = excluded_cats.split(',')
 
-  direction_str = 'ASC'
-  if (direction == 'desc'):
-    direction_str = 'DESC'
+  # ordering
+  order_map = {
+    'title': 'title',
+    'release_date': 'created_at',
+    'popularity': 'play_count'
+  }
+  if order not in order_map:
+    raise web.HTTPBadRequest(reason=f"unsupported order: {order}")
+  if direction not in ('asc', 'desc'):
+    raise web.HTTPBadRequest(reason=f"unsupported direction: {direction}")
+
+  order_str = order_map[order]
+  direction_str = direction.upper()
 
   #query
-  scenes = stash._GQL("""
-    query getScenes($perpage: Int, $page: Int, $order: String, $dir: SortDirectionEnum, $cats: [ID!]) {
-      findScenes(filter: { per_page: $perpage, page: $page, sort: $order, direction: $dir }
-           scene_filter: { tags: { modifier: INCLUDES_ALL, value: $cats } }) {
+  result = await asyncio.to_thread(stash.call_GQL, """
+    query getScenes($perpage: Int, $page: Int, $order: String, $dir: SortDirectionEnum, $title: String, $cats: [ID!], $excludedCats: [ID!]) {
+      findScenes(filter: { per_page: $perpage, page: $page, sort: $order, direction: $dir, q: $title }
+           scene_filter: { tags: { modifier: INCLUDES_ALL, value: $cats, excludes: $excludedCats } }) {
         count
         scenes {
           id
@@ -131,6 +219,7 @@ async def webGetVideos(request):
           created_at
           files {
             basename
+            duration
           }
         }
       }
@@ -139,24 +228,31 @@ async def webGetVideos(request):
     'page': pageIndex+1,
     'order': order_str,
     'dir': direction_str,
-    'cats': cats
-    })['findScenes']
+    'title': title,
+    'cats': cats,
+    'excludedCats': excluded_cats
+    })
+  scenes = result['findScenes']
   
   scene_count = scenes['count']
   scenes = scenes['scenes']
-  page_count = math.ceil(int(scene_count)/int(pageSize))
+  page_count = max(1, math.ceil(int(scene_count)/int(pageSize)))
 
   scenes_output = []
   for s in scenes:
+    title = s['title'] or (s['files'][0]['basename'] if s['files'] else f"Scene {s['id']}")
+    duration_seconds = round(s['files'][0].get('duration') or 0) if s['files'] else 0
     s_out = {
       'id': s['id'],
-      'title': s['title'],
-      'preview_image': preview_image(s['id'])
+      'title': title,
+      'preview_image': preview_image(request, s['id']),
+      'details': [{
+        'type': 'full',
+        'duration_seconds': duration_seconds
+      }]
     }
 
-    # fix missing titles and dates
-    if (s_out['title'] == ''):
-      s_out['title'] = s['files'][0]['basename']
+    # fix missing dates
     if (s['date'] != None):
       s_out['release_date'] = timestamp(s['date'])
     else:
@@ -177,104 +273,68 @@ async def webGetVideos(request):
 
 @routes.get(API_BASE+'video/{idd}')
 async def webGetVideo(request):
-  idd_str = request.match_info.get('idd', 'Invalid')
-  if (idd_str == 'Invalid'):
-    return web.HTTPBadRequest("invalid video id")
-  idd = int(idd_str)
+  try:
+    idd = int(request.match_info['idd'])
+  except (KeyError, TypeError, ValueError):
+    raise web.HTTPBadRequest(reason="video id must be an integer")
 
-  s = stash._GQL("""
+  result = await asyncio.to_thread(stash.call_GQL, """
     query getScene($id: ID!) {
       findScene(id: $id) {
         id
         title
-        release_date: created_at
+        date
+        created_at
         description: details
-        duration: play_duration
+        files {
+          basename
+          duration
+        }
+        tags {
+          id
+          name
+        }
       }
-  }""", {'id': idd})['findScene']
+  }""", {'id': idd})
+  s = result['findScene']
+
+  if s is None:
+    raise web.HTTPNotFound(reason="video not found")
+
+  title = s['title'] or (s['files'][0]['basename'] if s['files'] else f"Scene {s['id']}")
+  duration_seconds = round(s['files'][0].get('duration') or 0) if s['files'] else 0
+  release_date = timestamp(s['date'] or s['created_at'])
+  projection, stereo = video_format(s['tags'])
 
   scene = {
     'id': s['id'],
-    'title': s['title'],
-    'release_date': timestamp(s['release_date']),
-    'preview_image': preview_image(s['id']),
+    'title': title,
+    'description': s['description'],
+    'release_date': release_date,
+    'preview_image': preview_image(request, s['id']),
+    'categories': [
+      {'id': tag['id'], 'title': tag['name']}
+      for tag in s['tags']
+    ],
     'details': [{
       'type': 'full',
-      'duration': s['duration'],
+      'duration_seconds': duration_seconds,
       'links': [{
         'is_stream': True,
         'is_download': False,
-        'projection': '180',
-        'stereo': 'LR',
-        'url': stream_url(s['id']) 
+        'projection': projection,
+        'stereo': stereo,
+        'url': stream_url(request, s['id'])
       }]
     }]
   }
 
   return web.json_response(wrapJSON(scene))
 
-@routes.get('/getvid/{idd}')
-async def webGetVideo(request):
-  print(request.url.host)
-  idd_str = request.match_info.get('idd', 'Invalid')
-  if (idd_str == 'Invalid'):
-    raise web.HTTPBadRequest(reason="Invalid video ID")
-  idd = int(idd_str)
-
-  v = allVideoInfo[idd]
-  file_path = v['filepath']
-  print ('attempting to stream', file_path)
-
-  if not os.path.exists(file_path):
-    raise web.HTTPNotFound()
-
-  file_size = os.path.getsize(file_path)
-  range_header = request.headers.get('Range')
-
-  if range_header:
-    # Parse Range header (e.g., "bytes=0-1023")
-    print('this request has a Range')
-    try:
-      range_parts = range_header.split('=')[1].split('-')
-      start = int(range_parts[0])
-      end = int(range_parts[1]) if range_parts[1] else file_size - 1
-    except (ValueError, IndexError):
-      raise web.HTTPBadRequest(reason="Invalid Range header")
-
-    if not (0 <= start <= end < file_size):
-      raise web.HTTPRequestedRangeNotSatisfiable()
-
-    response = web.StreamResponse(
-      status=206,  # Partial Content
-      headers={
-        'Content-Range': f'bytes {start}-{end}/{file_size}',
-        'Content-Length': str(end - start + 1),
-        'Accept-Ranges': 'bytes'
-      }
-    )
-    await response.prepare(request)
-
-    with open(file_path, 'rb') as f:
-      f.seek(start)
-      chunk_size = 8192
-      while start <= end:
-        read_size = min(chunk_size, end - start + 1)
-        chunk = f.read(read_size)
-        if not chunk:
-            break
-        await response.write(chunk)
-        start += len(chunk)
-    return response
-  else:
-    print('this request does not have a Range')
-    # Serve the entire file if no Range header is present
-    return web.FileResponse(file_path)
-
-  
-
 app = web.Application()
+app.cleanup_ctx.append(http_client_context)
 app.add_routes(routes)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=LOG_LEVEL)
 web.run_app(app, port=PORT, access_log_format=" :: %r %s %T %t")
 
 # async def handle(request):
